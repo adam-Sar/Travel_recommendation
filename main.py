@@ -77,7 +77,10 @@ def load_data_from_supabase():
 @app.post("/start-quiz")
 def start_quiz():
     load_data_from_supabase()
-    return {"message": "Quiz data loaded"}
+    return {
+        "status":"success",
+        "message": "Quiz data loaded"
+        }
 
 @app.post("/budget_filter")
 def budget_filter(inputs: TripPreferencesRequest):
@@ -134,8 +137,43 @@ def tag_filter(inputs: UserTagsRequest):
     )]
 
     return {
-        "message": "Filter applied successfully",
+        "status": "success",
+        "message": "districts filtered based on tags",
         "matched_districts_count": len(filtered_df),
         "matched_districts": filtered_df.to_dict(orient="records")
+    }
+
+@app.post("/recommend")
+def recommend(input: TravelInput):
+    global top_districts
+    global districts_df
+
+    # Build a sentence based on user input
+    user_sentence = f"I want to travel for {input.purpose}. I am interested in {input.interests}. I prefer {input.weather} weather."
+
+    # Get the embedding vector for the user's sentence
+    user_embedding = model.encode(user_sentence)
+
+    districts_scores = []
+
+    # Loop over all districts and compute similarity with user preferences
+    for district, embedding in zip(districts_df["district"], districts_df["embedding"]):
+        score = cosine_similarity([user_embedding], [embedding])[0][0]
+        districts_scores.append((district, score))
+
+    # Sort districts by similarity score in descending order
+    districts_scores.sort(key=lambda x: x[1], reverse=True)
+
+    # Extract top 6 districts
+    top_districts = [d[0] for d in districts_scores[:6]]
+
+    # Return top districts with their similarity scores
+    return {
+        "status":"success",
+        "message": "Top travel districts recommendations generated",
+        "recommendations": [
+            {"district": district, "score": round(score, 4)}
+            for district, score in districts_scores[:6]
+        ]
     }
 
