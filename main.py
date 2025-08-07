@@ -1,4 +1,4 @@
-import json
+from math import floor
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -78,3 +78,44 @@ def load_data_from_supabase():
 def start_quiz():
     load_data_from_supabase()
     return {"message": "Quiz data loaded"}
+
+@app.post("/budget_filter")
+def budget_filter(inputs: TripPreferencesRequest):
+    global hotels_df, restaurants_df, tours_df
+
+    total_budget_min = inputs.budget_min
+    total_budget_max = inputs.budget_max
+
+    # Assume the user needs hotel for every day of the trip
+    inputs.activity_counts["hotel"] = inputs.nb_of_days
+
+    # Calculates min/max budget per activity item (e.g., per hotel/night, per restaurant meal, etc.)
+    def budget_range(category: str):
+        perc = inputs.budget_percentages.get(category, 0)
+        count = inputs.activity_counts.get(category, 1)
+        count = max(count,1)  
+        min_budget = floor((total_budget_min * perc / 100) / count)
+        max_budget = floor((total_budget_max * perc / 100) / count)
+        return (min_budget, max_budget)
+
+    hotel_budget_range = budget_range('hotel')
+    restaurant_budget_range = budget_range('restaurant')
+    tour_budget_range = budget_range('tour')
+
+    # Filters the given DataFrame by a price column using a budget range
+    def filter_by_budget(df, price_column, budget_range):
+        return df[df[price_column].between(*budget_range)]
+
+    hotels_df = filter_by_budget(hotels_df, 'price_per_day', hotel_budget_range)
+    restaurants_df = filter_by_budget(restaurants_df, 'avg_price', restaurant_budget_range)
+    tours_df = filter_by_budget(tours_df, 'price', tour_budget_range)
+
+    return {
+        "status": "success",
+        "message": "Activities filtered based on budget",
+        "data": {
+            "hotels": hotels_df.to_dict(orient="records"),
+            "restaurants": restaurants_df.to_dict(orient="records"),
+            "tours": tours_df.to_dict(orient="records"),
+        }
+    }
