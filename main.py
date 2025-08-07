@@ -48,3 +48,33 @@ class UserTagsRequest (BaseModel):
 
 # Global variable to store top districts
 top_districts: List[str] = []
+
+# Fetch table data from Supabase and return as DataFrame
+def fetch_table_data(table_name, columns):
+    response = supabase.table(table_name).select(columns).execute()
+    return pd.DataFrame(response.data)
+
+# Load all required tables concurrently from Supabase
+def load_data_from_supabase():
+    global districts_df, hotels_df, restaurants_df, tours_df
+
+    # Use threads to fetch all tables in parallel
+    with ThreadPoolExecutor() as executor:
+        futures = {
+            "districts": executor.submit(fetch_table_data, "districts", "country,district,description,tags,embedding"),
+            "hotels": executor.submit(fetch_table_data, "hotels", "name,country,district,price_per_day,rating,description,facilities"),
+            "restaurants": executor.submit(fetch_table_data, "restaurants", "title,country,district,avg_price,rating,description,tag"),
+            "tours": executor.submit(fetch_table_data, "tours", "title,country,district,duration,price,description")
+        }
+
+        # Store results in global variables
+        districts_df = futures["districts"].result()
+        hotels_df = futures["hotels"].result()
+        restaurants_df = futures["restaurants"].result()
+        tours_df = futures["tours"].result()
+
+# API endpoint to trigger quiz data loading
+@app.post("/start-quiz")
+def start_quiz():
+    load_data_from_supabase()
+    return {"message": "Quiz data loaded"}
