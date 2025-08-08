@@ -132,15 +132,15 @@ def tag_filter(inputs: UserTagsRequest):
         return sum(1 for x in user_list if x in tags_list)
 
     # Filter districts that share at least 2 tags with the user
-    filtered_df = districts_df[districts_df["tags"].apply(
+    districts_df = districts_df[districts_df["tags"].apply(
         lambda column_tags: count_sum(inputs.user_tags, column_tags) >= 2
     )]
 
     return {
         "status": "success",
         "message": "districts filtered based on tags",
-        "matched_districts_count": len(filtered_df),
-        "matched_districts": filtered_df.to_dict(orient="records")
+        "matched_districts_count": len(districts_df),
+        "matched_districts": districts_df.to_dict(orient="records")
     }
 
 @app.post("/recommend")
