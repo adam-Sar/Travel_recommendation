@@ -10,9 +10,10 @@ from pydantic import BaseModel
 from typing import Dict
 from supabase import create_client
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from time import sleep
+from threading import Thread
 
-#initialize app
-app = FastAPI()
 #initialize embedding model
 model = SentenceTransformer('all-mpnet-base-v2')
 
@@ -23,6 +24,12 @@ url = os.getenv("SUPABASE_URL")
 key = os.getenv("SUPABASE_KEY")
 
 supabase = create_client(url,key)
+
+#declare cached dataframes for automatic caching
+cached_districts_df = pd.DataFrame()
+cached_hotels_df = pd.DataFrame()
+cached_restaurants_df = pd.DataFrame()
+cached_tours_df = pd.DataFrame()
 
 #declare data frames
 districts_df = pd.DataFrame()
@@ -40,7 +47,7 @@ class TripPreferencesRequest (BaseModel):
     nb_of_days: int                          
     budget_min: int
     budget_max: int
-    activity_counts: Dict[str, int]  #ex: {"hotel":3,"restaurant":2,"tour":3}, how many times go for each        
+    activity_counts: Dict[str, Optional[int]]  #ex: {"hotel":3,"restaurant":2,"tour":3}, how many times go for each        
     budget_percentages: Dict[str, float] #percentage of budget given for each activity 
 
 class UserTagsRequest (BaseModel):
@@ -56,7 +63,7 @@ def fetch_table_data(table_name, columns):
 
 # Load all required tables concurrently from Supabase
 def load_data_from_supabase():
-    global districts_df, hotels_df, restaurants_df, tours_df
+    global cached_districts_df, cached_hotels_df, cached_restaurants_df, cached_tours_df
 
     # Use threads to fetch all tables in parallel
     with ThreadPoolExecutor() as executor:
@@ -67,19 +74,46 @@ def load_data_from_supabase():
             "tours": executor.submit(fetch_table_data, "tours", "title,country,district,duration,price,description")
         }
 
-        # Store results in global variables
-        districts_df = futures["districts"].result()
-        hotels_df = futures["hotels"].result()
-        restaurants_df = futures["restaurants"].result()
-        tours_df = futures["tours"].result()
+        # Store results in global cached variables
+        cached_districts_df = futures["districts"].result()
+        cached_hotels_df = futures["hotels"].result()
+        cached_restaurants_df = futures["restaurants"].result()
+        cached_tours_df = futures["tours"].result()
+
+RELOAD_INTERVAL_MINUTES = 30 
+def reload_function():
+    while True:
+        load_data_from_supabase()
+        sleep(RELOAD_INTERVAL_MINUTES*60)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    #start background thread at startup
+    thread = Thread(target=reload_function,daemon=True)
+    thread.start()
+    yield
+
+
+#initialize app
+app = FastAPI(lifespan=lifespan)
 
 # API endpoint to trigger quiz data loading
 @app.post("/start-quiz")
 def start_quiz():
-    load_data_from_supabase()
+    global districts_df, hotels_df, restaurants_df, tours_df
+    districts_df = cached_districts_df.copy()
+    hotels_df = cached_hotels_df.copy()
+    restaurants_df =  cached_restaurants_df.copy()
+    tours_df =  cached_tours_df.copy()
     return {
         "status":"success",
-        "message": "Quiz data loaded"
+        "message": "Quiz data loaded",
+        "data": {
+            "districts": districts_df.to_dict(orient="records"),
+            "hotels": hotels_df.to_dict(orient="records"),
+            "restaurants": restaurants_df.to_dict(orient="records"),
+            "tours": tours_df.to_dict(orient="records"),
+        }
         }
 
 @app.post("/budget_filter")
@@ -132,15 +166,15 @@ def tag_filter(inputs: UserTagsRequest):
         return sum(1 for x in user_list if x in tags_list)
 
     # Filter districts that share at least 2 tags with the user
-    filtered_df = districts_df[districts_df["tags"].apply(
+    districts_df = districts_df[districts_df["tags"].apply(
         lambda column_tags: count_sum(inputs.user_tags, column_tags) >= 2
     )]
 
     return {
         "status": "success",
         "message": "districts filtered based on tags",
-        "matched_districts_count": len(filtered_df),
-        "matched_districts": filtered_df.to_dict(orient="records")
+        "matched_districts_count": len(districts_df),
+        "matched_districts": districts_df.to_dict(orient="records")
     }
 
 @app.post("/recommend")
