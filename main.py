@@ -12,7 +12,8 @@ from supabase import create_client
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import sleep
-from threading import Thread
+from threading import Thread,Event
+
 
 #initialize embedding model
 model = SentenceTransformer('all-mpnet-base-v2')
@@ -56,6 +57,8 @@ class UserTagsRequest (BaseModel):
 # Global variable to store top districts
 top_districts: List[str] = []
 
+#event to check if caching is ready
+cache_ready_event = Event()
 # Fetch table data from Supabase and return as DataFrame
 def fetch_table_data(table_name, columns):
     response = supabase.table(table_name).select(columns).execute()
@@ -64,7 +67,8 @@ def fetch_table_data(table_name, columns):
 # Load all required tables concurrently from Supabase
 def load_data_from_supabase():
     global cached_districts_df, cached_hotels_df, cached_restaurants_df, cached_tours_df
-
+    #so that while being updated the data isn't copied in start quiz
+    cache_ready_event.clear()
     # Use threads to fetch all tables in parallel
     with ThreadPoolExecutor() as executor:
         futures = {
@@ -79,6 +83,7 @@ def load_data_from_supabase():
         cached_hotels_df = futures["hotels"].result()
         cached_restaurants_df = futures["restaurants"].result()
         cached_tours_df = futures["tours"].result()
+        cache_ready_event.set()
 
 RELOAD_INTERVAL_MINUTES = 30 
 def reload_function():
@@ -93,7 +98,6 @@ async def lifespan(app: FastAPI):
     thread.start()
     yield
 
-
 #initialize app
 app = FastAPI(lifespan=lifespan)
 
@@ -101,20 +105,23 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/start-quiz")
 def start_quiz():
     global districts_df, hotels_df, restaurants_df, tours_df
+    #wait till the data is loaded and cached
+    cache_ready_event.wait()
+    #make copies of the cached data for the user
     districts_df = cached_districts_df.copy()
     hotels_df = cached_hotels_df.copy()
     restaurants_df =  cached_restaurants_df.copy()
     tours_df =  cached_tours_df.copy()
     return {
-        "status":"success",
+        "status": "success",
         "message": "Quiz data loaded",
         "data": {
             "districts": districts_df.to_dict(orient="records"),
             "hotels": hotels_df.to_dict(orient="records"),
             "restaurants": restaurants_df.to_dict(orient="records"),
-            "tours": tours_df.to_dict(orient="records"),
+            "tours": tours_df.to_dict(orient="records")
         }
-        }
+    }
 
 @app.post("/budget_filter")
 def budget_filter(inputs: TripPreferencesRequest):
@@ -143,51 +150,109 @@ def budget_filter(inputs: TripPreferencesRequest):
     def filter_by_budget(df, price_column, budget_range):
         return df[df[price_column].between(*budget_range)]
 
-    hotels_df = filter_by_budget(hotels_df, 'price_per_day', hotel_budget_range)
-    restaurants_df = filter_by_budget(restaurants_df, 'avg_price', restaurant_budget_range)
-    tours_df = filter_by_budget(tours_df, 'price', tour_budget_range)
+    filtered_hotels_df = filter_by_budget(hotels_df, 'price_per_day', hotel_budget_range)
+    filtered_restaurants_df = filter_by_budget(restaurants_df, 'avg_price', restaurant_budget_range)
+    filtered_tours_df = filter_by_budget(tours_df, 'price', tour_budget_range)
 
-    return {
+    if filtered_hotels_df.empty:
+        return{
+            "status": "repeat",
+            "message": "no hotels found, choose other answers"
+        }
+    elif filtered_restaurants_df.empty:
+        return{
+            "status": "repeat",
+            "message": "no restaurants found, choose other answers"
+        }
+    elif filtered_tours_df.empty:
+        return{
+            "status": "repeat",
+            "message": "no tours found, choose other answers"
+        }
+    else:
+        hotels_df= filtered_hotels_df
+        restaurants_df= filtered_restaurants_df
+        tours_df= filtered_tours_df
+        return {
         "status": "success",
         "message": "Activities filtered based on budget",
         "data": {
             "hotels": hotels_df.to_dict(orient="records"),
             "restaurants": restaurants_df.to_dict(orient="records"),
-            "tours": tours_df.to_dict(orient="records"),
+            "tours": tours_df.to_dict(orient="records")
         }
     }
+    
 
 @app.post("/tags_filter")
 def tag_filter(inputs: UserTagsRequest):
-    global districts_df
+    global districts_df,hotels_df,tours_df,restaurants_df
 
     # Count how many tags in the user's list exist in the district's tags
     def count_sum(user_list, tags_list):
         return sum(1 for x in user_list if x in tags_list)
-
     # Filter districts that share at least 2 tags with the user
-    districts_df = districts_df[districts_df["tags"].apply(
+    filtered_districts_df = districts_df[districts_df["tags"].apply(
         lambda column_tags: count_sum(inputs.user_tags, column_tags) >= 2
-    )]
+    )]["district"]
 
-    return {
-        "status": "success",
-        "message": "districts filtered based on tags",
-        "matched_districts_count": len(districts_df),
-        "matched_districts": districts_df.to_dict(orient="records")
-    }
+    if filtered_districts_df.empty:
+        return{
+            "status":"repeat",
+            "message":"no districts found, choose other answers"
+        }
+    else:
+        districts = filtered_districts_df.to_list()
+        filtered_hotels_df = hotels_df[hotels_df["district"].isin(districts)]
+        filtered_restaurants_df = restaurants_df[restaurants_df["district"].isin(districts)]
+        filtered_tours_df = tours_df[tours_df["district"].isin(districts)]
+             
+        if filtered_hotels_df.empty:
+            return{
+                "status": "repeat",
+                "message": "no hotels found, choose other tags"
+            }
+        elif filtered_restaurants_df.empty:
+            return{
+                "status": "repeat",
+                "message": "no restaurants found, choose other tags"
+            }
+        elif filtered_tours_df.empty:
+            return{
+                "status": "repeat",
+                "message": "no tours found, choose other tags"
+            }
+        else:
+            districts_df = filtered_districts_df
+            hotels_df= filtered_hotels_df
+            restaurants_df= filtered_restaurants_df
+            tours_df= filtered_tours_df
+            return {
+            "status": "success",
+            "message": "districts filtered based on tags, all data filtered based on districts",
+            "matched_districts_count": len(districts),
+            "data":{
+                "districts": districts_df.to_dict(orient="records"),
+                "hotels": hotels_df.to_dict(orient="records"),
+                "restaurants": restaurants_df.to_dict(orient="records"),
+                "tours": tours_df.to_dict(orient="records")
+            }
+        }
+
+
+
+        
 
 @app.post("/recommend")
 def recommend(input: TravelInput):
     global top_districts
-    global districts_df
+    global districts_df,hotels_df,restaurants_df,tours_df
 
     # Build a sentence based on user input
     user_sentence = f"I want to travel for {input.purpose}. I am interested in {input.interests}. I prefer {input.weather} weather."
 
     # Get the embedding vector for the user's sentence
     user_embedding = model.encode(user_sentence)
-
     districts_scores = []
 
     # Loop over all districts and compute similarity with user preferences
@@ -201,13 +266,41 @@ def recommend(input: TravelInput):
     # Extract top 6 districts
     top_districts = [d[0] for d in districts_scores[:6]]
 
-    # Return top districts with their similarity scores
-    return {
-        "status":"success",
-        "message": "Top travel districts recommendations generated",
-        "recommendations": [
-            {"district": district, "score": round(score, 4)}
+    filtered_hotels_df = hotels_df[hotels_df["district"].isin(top_districts)]
+    filtered_restaurants_df = restaurants_df[restaurants_df["district"].isin(top_districts)]
+    filtered_tours_df = tours_df[tours_df["district"].isin(top_districts)]
+    
+    if filtered_hotels_df.empty:
+        return{
+            "status": "repeat",
+            "message": "no hotels found, choose other answers"
+        }
+    elif filtered_restaurants_df.empty:
+        return{
+            "status": "repeat",
+            "message": "no restaurants found, choose other answers"
+        }
+    elif filtered_tours_df.empty:
+        return{
+            "status": "repeat",
+            "message": "no tours found, choose other answers"
+        }
+    else:
+        districts_df= districts_df[districts_df["district"].isin(top_districts)]
+        hotels_df= filtered_hotels_df
+        restaurants_df= filtered_restaurants_df
+        tours_df= filtered_tours_df
+        return {
+        "status": "success",
+        "message": "Top travel districts recommendations generated, all data filtered based on recommended districts",
+        "recommendation": [
+            {"district":district, "score":round(score,4)}
             for district, score in districts_scores[:6]
-        ]
+        ],
+        "data":{
+            "districts": districts_df.to_dict(orient="records"),
+            "hotels": hotels_df.to_dict(orient="records"),
+            "restaurants": restaurants_df.to_dict(orient="records"),
+            "tours": tours_df.to_dict(orient="records")
+        }
     }
-
