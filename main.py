@@ -13,6 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import sleep
 from threading import Thread,Event
+import google.generativeai as genai
+from fastapi.responses import StreamingResponse
+import asyncio
 
 
 #initialize embedding model
@@ -38,6 +41,10 @@ hotels_df = pd.DataFrame()
 restaurants_df = pd.DataFrame()
 tours_df = pd.DataFrame()
 
+#config the genai
+api_key= os.getenv("google_api_key")
+genai.configure(api_key=api_key)
+
 #define data models
 class TravelInput (BaseModel):
     purpose: str 
@@ -57,6 +64,8 @@ class UserTagsRequest (BaseModel):
 # Global variable to store top districts
 top_districts: List[str] = []
 
+#store all user inputs
+user_inputs: Dict = {}
 #event to check if caching is ready
 cache_ready_event = Event()
 # Fetch table data from Supabase and return as DataFrame
@@ -125,7 +134,12 @@ def start_quiz():
 
 @app.post("/budget_filter")
 def budget_filter(inputs: TripPreferencesRequest):
-    global hotels_df, restaurants_df, tours_df
+    global hotels_df, restaurants_df, tours_df,user_inputs
+
+    user_inputs["nb_of_days"]=inputs.nb_of_days
+    user_inputs["budget_min"]=inputs.budget_min
+    user_inputs["budget_max"]=inputs.budget_max
+    user_inputs["activity_counts"]=inputs.activity_counts
 
     total_budget_min = inputs.budget_min
     total_budget_max = inputs.budget_max
@@ -145,6 +159,9 @@ def budget_filter(inputs: TripPreferencesRequest):
     hotel_budget_range = budget_range('hotel')
     restaurant_budget_range = budget_range('restaurant')
     tour_budget_range = budget_range('tour')
+
+    user_inputs["activities_budgets"]={"hotel_budget_range":hotel_budget_range,"restaurant_budget_range":restaurant_budget_range
+                                       ,"tour_budget_range":tour_budget_range}
 
     # Filters the given DataFrame by a price column using a budget range
     def filter_by_budget(df, price_column, budget_range):
@@ -185,7 +202,9 @@ def budget_filter(inputs: TripPreferencesRequest):
     
 @app.post("/tags_filter")
 def tag_filter(inputs: UserTagsRequest):
-    global districts_df,hotels_df,tours_df,restaurants_df
+    global districts_df,hotels_df,tours_df,restaurants_df,user_inputs
+
+    user_inputs["tags"]=inputs.user_tags
 
     # Count how many tags in the user's list exist in the district's tags
     def count_sum(user_list, tags_list):
@@ -193,7 +212,7 @@ def tag_filter(inputs: UserTagsRequest):
     # Filter districts that share at least 2 tags with the user
     filtered_districts_df = districts_df[districts_df["tags"].apply(
         lambda column_tags: count_sum(inputs.user_tags, column_tags) >= 2
-    )]["district"]
+    )]
 
     if filtered_districts_df.empty:
         return{
@@ -201,11 +220,11 @@ def tag_filter(inputs: UserTagsRequest):
             "message":"no districts found, choose other answers"
         }
     else:
-        districts = filtered_districts_df.to_list()
+        districts = filtered_districts_df["district"].to_list()
         filtered_hotels_df = hotels_df[hotels_df["district"].isin(districts)]
         filtered_restaurants_df = restaurants_df[restaurants_df["district"].isin(districts)]
         filtered_tours_df = tours_df[tours_df["district"].isin(districts)]
-             
+        
         if filtered_hotels_df.empty:
             return{
                 "status": "repeat",
@@ -239,12 +258,16 @@ def tag_filter(inputs: UserTagsRequest):
         }        
 
 @app.post("/recommend")
-def recommend(input: TravelInput):
+def recommend(inputs: TravelInput):
     global top_districts
-    global districts_df,hotels_df,restaurants_df,tours_df
+    global districts_df,hotels_df,restaurants_df,tours_df,user_inputs
+
+    user_inputs["purpose"]=inputs.purpose
+    user_inputs["interests"]=inputs.interests
+    user_inputs["weather"]=inputs.weather
 
     # Build a sentence based on user input
-    user_sentence = f"I want to travel for {input.purpose}. I am interested in {input.interests}. I prefer {input.weather} weather."
+    user_sentence = f"I want to travel for {inputs.purpose}. I am interested in {inputs.interests}. I prefer {inputs.weather} weather."
 
     # Get the embedding vector for the user's sentence
     user_embedding = model.encode(user_sentence)
@@ -299,3 +322,59 @@ def recommend(input: TravelInput):
             "tours": tours_df.to_dict(orient="records")
         }
     }
+
+generative_model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+
+async def chatbot_output_streamer():
+    global user_inputs
+    # Build the structured prompt
+    prompt = f"""
+    You are a travel planning AI. The user has given their trip preferences and we have filtered travel data for them. 
+    Your task is to generate **3 complete itineraries**, each covering the full trip duration. 
+    For each itinerary:
+    - Pick exactly **one district** (different for each itinerary) from the provided data.
+    - Pick exactly **one hotel** from that district for the entire stay.
+    - Select restaurants and tours **only from that same district**.
+    - Use the activity counts and budgets to decide how many restaurants/tours THE user will go to, and how much to spend daily.
+    - The number of days is {user_inputs.get("nb_of_days")}.
+    - The restaurants/tours must be spread across the days according to the activity_counts: {user_inputs.get("activity_counts")}.
+    - Each activity must respect the given daily budget ranges: {user_inputs.get("activities_budgets")}.
+    - Districts also have tags; consider both the tags and descriptions when matching the user’s preferences.
+    - The user tags are: {user_inputs.get("tags")}.
+    - User purpose: {user_inputs.get("purpose")}.
+    - User interests: {user_inputs.get("interests")}.
+    - Preferred weather: {user_inputs.get("weather")}.
+
+    **Available Data** (pandas DataFrames converted to JSON):
+
+    DISTRICTS:
+    {districts_df.to_dict(orient="records")}
+
+    HOTELS:
+    {hotels_df.to_dict(orient="records")}
+
+    RESTAURANTS:
+    {restaurants_df.to_dict(orient="records")}
+
+    TOURS:
+    {tours_df.to_dict(orient="records")}
+
+    **Rules:**
+    1. One district per itinerary, hotel/restaurants/tours all from that district.
+    2. Respect the activity counts (e.g., if restaurants=2 in activity_counts and nb_of_days=4, schedule restaurant visits for exactly 2 different days).
+    3. Ensure each chosen restaurant/tour fits in its budget range for its category.
+    4. Use variety: do not pick the same restaurant or tour twice in the same itinerary.
+    5. The output must be **detailed day-by-day** with all activities.
+
+    Return your answer as **3 separate itineraries**, each clearly labeled and formatted for easy reading.
+    """
+
+    # Stream the generation
+    for chunk in generative_model.generate_content(prompt, stream=True):
+        if chunk.text:
+            yield chunk.text.replace("*", "") + "\n"
+
+
+@app.get("/generate")
+async def generate():
+    return StreamingResponse(chatbot_output_streamer(),media_type="text/plain")
