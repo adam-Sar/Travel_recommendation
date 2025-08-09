@@ -183,7 +183,6 @@ def budget_filter(inputs: TripPreferencesRequest):
         }
     }
     
-
 @app.post("/tags_filter")
 def tag_filter(inputs: UserTagsRequest):
     global districts_df,hotels_df,tours_df,restaurants_df
@@ -237,11 +236,7 @@ def tag_filter(inputs: UserTagsRequest):
                 "restaurants": restaurants_df.to_dict(orient="records"),
                 "tours": tours_df.to_dict(orient="records")
             }
-        }
-
-
-
-        
+        }        
 
 @app.post("/recommend")
 def recommend(input: TravelInput):
