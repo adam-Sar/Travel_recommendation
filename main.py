@@ -19,7 +19,7 @@ import asyncio
 
 
 #initialize embedding model
-model = SentenceTransformer('all-mpnet-base-v2')
+model = SentenceTransformer('model/trained_model')
 
 #load supabase credentials
 load_dotenv()
@@ -365,16 +365,43 @@ async def chatbot_output_streamer():
     3. Ensure each chosen restaurant/tour fits in its budget range for its category.
     4. Use variety: do not pick the same restaurant or tour twice in the same itinerary.
     5. The output must be **detailed day-by-day** with all activities.
+    6. Choose all the activities, restos, hotels, on your own, don't give a chance for the user to choose them you do it.
 
     Return your answer as **3 separate itineraries**, each clearly labeled and formatted for easy reading.
+
+    **Important:**:Break your output into small readable segments. 
+    At the end of each segment, append the special marker "!!" (double exclamation). 
+    Do not put "!!" anywhere else in the text. 
+    This will let the client know where each chunk ends.
+    also don't write free time next to everything, and put the name of the tour that you recommended and provide some basic info about each
+    activity,
+    Don't repeat the check in to the same hotels each day, just say it once at the beginning of day one.
+    
     """
+    loop = asyncio.get_event_loop()
+    buffer = ""
 
     # Stream the generation
-    for chunk in generative_model.generate_content(prompt, stream=True):
-        if chunk.text:
-            yield chunk.text.replace("*", "") + "\n"
+    def generate_chunks_blocking():
+        nonlocal buffer
+        for chunk in generative_model.generate_content(prompt, stream=True):
+            text = chunk.text or ""
+            buffer += text
+            while "!!" in buffer:
+                part, buffer = buffer.split("!!", 1)
+                if part.strip():
+                    yield part.strip().replace("*","") + "\n"
+        # yield leftover text
+        if buffer.strip():
+            yield buffer.strip()
+
+    # Run the blocking generator in a thread and yield asynchronously
+    gen = generate_chunks_blocking()
+    for chunk in await loop.run_in_executor(None, lambda: gen):
+        yield chunk
+
 
 
 @app.get("/generate")
 async def generate():
-    return StreamingResponse(chatbot_output_streamer(),media_type="text/plain")
+    return StreamingResponse(chatbot_output_streamer(),media_type="text/event-stream")

@@ -4,8 +4,8 @@ from sentence_transformers import SentenceTransformer
 import os
 from supabase import create_client
 
-# Load the pre-trained sentence transformer model
-model = SentenceTransformer('all-mpnet-base-v2')
+# Load the fine-tuned sentence transformer model
+model = SentenceTransformer('model/trained_model')
 
 # Function to generate embedding for a given text
 def embedd(text):
