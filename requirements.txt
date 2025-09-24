@@ -7,6 +7,7 @@ numpy>=1.24.0
 # API Framework
 fastapi>=0.104.0
 uvicorn>=0.24.0
+gunicorn
 
 # Database and Cloud Services
 supabase>=2.0.0
